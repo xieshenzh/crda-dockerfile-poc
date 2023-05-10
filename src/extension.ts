@@ -5,6 +5,13 @@ import {Diagnostic} from 'vscode';
 import {DockerfileParser} from 'dockerfile-ast';
 import Docker = require('dockerode');
 
+const imageRegex = new RegExp('[q|Q][u|U][a|A][y|Y]\\.[i|I][o|O]\\/([^\\/.]+\\/)?[^\\/.]+(:.+)?');
+const digestRegex = new RegExp('Digest: sha256:[A-Fa-f{64}]');
+
+interface PullStatus {
+    status: string
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export function activate(context: vscode.ExtensionContext) {
@@ -65,7 +72,7 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
         for (let from of froms) {
             let image = from.getImage();
             console.log(image);
-            if (image) {
+            if (image && imageRegex.test(image)) {
                 try {
                     const pullStream = await docker.pull(image);
                     await new Promise(resolve => docker.modem.followProgress(pullStream, (error, result) => {
@@ -90,17 +97,24 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
                             });
                         } else {
                             console.log(result);
-                            let range = from.getImageRange();
-                            diagnostics.push({
-                                code: '',
-                                message: 'Image with vulnerabilities',
-                                range: new vscode.Range(
-                                    new vscode.Position(range?.start.line!, range?.start.character!), new vscode.Position(range?.end.line!, range?.end.character!),
-                                ),
-                                severity: vscode.DiagnosticSeverity.Error,
-                                source: '',
-                                relatedInformation: []
-                            });
+                            let results = result as object[];
+                            for (let status of results) {
+                                let s = status as PullStatus;
+                                if (digestRegex.test(s.status)) {
+                                    let range = from.getImageRange();
+                                    diagnostics.push({
+                                        code: '',
+                                        message: getImageManifestAddress(image!, s.status),
+                                        range: new vscode.Range(
+                                            new vscode.Position(range?.start.line!, range?.start.character!), new vscode.Position(range?.end.line!, range?.end.character!),
+                                        ),
+                                        severity: vscode.DiagnosticSeverity.Error,
+                                        source: '',
+                                        relatedInformation: []
+                                    });
+                                    break;
+                                }
+                            }
                         }
                     });
                 } catch (error) {
@@ -123,6 +137,12 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
     } else {
         return [] as Diagnostic[];
     }
+}
+
+function getImageManifestAddress(image: string, digest: string): string {
+    let repo = image.slice(8, image.lastIndexOf(":"));
+    let sha = digest.slice(8);
+    return 'https://quay.io/repository/' + repo + '/manifest/' + sha + '?tab=vulnerabilities';
 }
 
 const isError = (err: unknown): err is Error => err instanceof Error;
