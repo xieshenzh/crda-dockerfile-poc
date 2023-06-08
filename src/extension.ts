@@ -7,46 +7,64 @@ import * as rm from 'typed-rest-client/RestClient';
 import * as httpm from 'typed-rest-client/HttpClient';
 import Docker = require('dockerode');
 
-let imageRegex = new RegExp('[q|Q][u|U][a|A][y|Y]\\.[i|I][o|O]\\/([^\\/.]+\\/)?[^\\/.]+(:.+)?'); //todo
-let digestRegex = new RegExp('Digest: sha256:[A-Fa-f0-9{64}]');
+let imageRegex = new RegExp('^(?<Name>(?<=^)(?:(?<Domain>(?:(?:localhost|[\\w-]+(?:\\.[\\w-]+)+)(?::\\d+)?)|[\\w]+:\\d+)\\/)?\\/?(?<Namespace>(?:(?:[a-z0-9]+(?:(?:[._]|__|[-]*)[a-z0-9]+)*)\\/)*)(?<Repo>[a-z0-9-]+))[:@]?(?<Reference>(?<=:)(?<Tag>[\\w][\\w.-]{0,127})|(?<=@)(?<Digest>[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*[:][0-9A-Fa-f]{32,}))?');
 
 let baseUrl: string = 'https://quay.io';
 let restc: rm.RestClient = new rm.RestClient('crda', baseUrl);
 
 let severities: string[] = ['Critical', 'High', 'Medium', 'Low', 'Unknown'];
+let severityColors = new Map<string, string>([
+    ["Critical", "color: rgb(214, 68, 86)"],
+    ["High", "color: rgb(247, 116, 84)"],
+    ["Medium", "color: rgb(252, 166, 87)"],
+    ["Low", "color: rgb(248, 202, 28)"],
+    ["Unknown", "color: rgb(155, 155, 155)"],
+]);
 
-interface PullStatus {
-    status: string
+interface ManifestPayload {
+    digest: string,
+    is_manifest_list: boolean,
+    manifest_data: string,
+}
+
+interface Platform {
+    "architecture": string,
+    "os": string,
+}
+
+interface ManifestData {
+    mediaType: string,
+    manifests: Manifest[],
 }
 
 interface Manifest {
-    digest: string,
-    is_manifest_list: boolean,
-    manifest_data: string
+    "digest": string,
+    "platform": Platform,
 }
 
 interface Vulnerability {
     Name: string,
     Severity: string,
+    Link: string,
 }
 
 interface Feature {
     Name: string,
-    Vulnerabilities: Vulnerability[]
+    Vulnerabilities: Vulnerability[],
 }
 
 interface Layer {
     Name: string,
-    Features: Feature[]
+    Features: Feature[],
 }
 
 interface Data {
-    Layer: Layer
+    Layer: Layer,
 }
 
-interface Vulnerabilities {
+interface SecurityPayload {
     status: string,
-    data: Data
+    data: Data,
 }
 
 // This method is called when your extension is activated
@@ -107,31 +125,41 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
         for (let from of froms) {
             let image = from.getImage();
             console.log(image);
-            if (image && imageRegex.test(image)) {
+            if (image && imageRegex.test(image) && image.slice(0, 8).toLowerCase() === "quay.io/") {
                 try {
-                    let digests = await getImageDigest(image);
-                    let [repo, digest] = await getImageManifestRef(digests);
-                    let [message, severity] = await getImageVulnerabilities(repo, digest);
-
-                    let messageSeverity: DiagnosticSeverity;
-                    if (severity === "Critical" || severity === "High") {
-                        messageSeverity = DiagnosticSeverity.Error;
-                    } else if (severity !== undefined) {
-                        messageSeverity = DiagnosticSeverity.Warning;
+                    let [digests, arch, os] = await getImageDigest(image);
+                    if (digests === undefined) {
+                        continue;
                     }
 
-                    let range = from.getImageRange();
-                    diagnostics.push({
-                        code: '',
-                        message: message,
-                        range: new vscode.Range(new vscode.Position(range?.start.line!, range?.start.character!),
-                            new vscode.Position(range?.end.line!, range?.end.character!),),
-                        severity: messageSeverity,
-                        source: '',
-                        relatedInformation: []
-                    });
-                } catch
-                    (error) {
+                    let [repo, digest] = await getImageManifestRef(digests, arch, os);
+                    if (repo === undefined || digest === undefined) {
+                        continue;
+                    }
+
+                    let [message, severity] = await getImageVulnerabilities(repo, digest);
+                    if (message !== undefined) {
+                        let messageSeverity: DiagnosticSeverity;
+                        if (severity === "Critical" || severity === "High") {
+                            messageSeverity = DiagnosticSeverity.Error;
+                        } else if (severity !== undefined) {
+                            messageSeverity = DiagnosticSeverity.Warning;
+                        } else {
+                            messageSeverity = DiagnosticSeverity.Information;
+                        }
+
+                        let range = from.getImageRange();
+                        diagnostics.push({
+                            code: '',
+                            message: message,
+                            range: new vscode.Range(new vscode.Position(range?.start.line!, range?.start.character!),
+                                new vscode.Position(range?.end.line!, range?.end.character!),),
+                            severity: messageSeverity,
+                            source: '',
+                            relatedInformation: []
+                        });
+                    }
+                } catch (error) {
                     console.error(error);
                     let range = from.getImageRange();
                     diagnostics.push({
@@ -163,15 +191,15 @@ async function getImageVulnerabilities(repository: string, digest: string): Prom
         }
     };
 
-    let restRes: rm.IRestResponse<Vulnerabilities> = await restc.get<Vulnerabilities>(path, options);
+    let restRes: rm.IRestResponse<SecurityPayload> = await restc.get<SecurityPayload>(path, options);
     if (restRes.statusCode === httpm.HttpCodes.NotFound) {
-        return ["Status Code 404 - Request to quay.io failed", "Critical"];
+        throw Error("Status Code 404 - Request to quay.io failed");
     }
 
-    let vulMap = new Map<string, string>();
+    let vulMap = new Map<string, Vulnerability>();
     for (let feature of restRes.result.data.Layer.Features) {
         for (let vul of feature.Vulnerabilities) {
-            vulMap.set(vul.Name, vul.Severity);
+            vulMap.set(vul.Name, vul);
         }
     }
 
@@ -182,10 +210,15 @@ async function getImageVulnerabilities(repository: string, digest: string): Prom
     let severitySet = new Set<string>();
     let message: string = "";
     for (let severity of severities) {
-        for (let [n, s] of vulMap) {
-            if (s === severity) {
-                severitySet.add(s);
-                message += (n + ": " + s + "\n");
+        for (let [n, v] of vulMap) {
+            if (v.Severity === severity) {
+                severitySet.add(v.Severity);
+                message += n + ": " + v.Severity;
+                if (v.Link !== undefined && v.Link.length > 0) {
+                    message += ": " + v.Link + "\n";
+                } else {
+                    message += "\n";
+                }
             }
         }
     }
@@ -199,7 +232,7 @@ async function getImageVulnerabilities(repository: string, digest: string): Prom
     return [message, undefined];
 }
 
-async function getImageDigest(imgName: string): Promise<string[]> {
+async function getImageDigest(imgName: string): Promise<[string[], string, string]> {
     let docker = new Docker();
     let pullStream = await docker.pull(imgName);
     await new Promise(resolve => docker.modem.followProgress(pullStream, (error, result) => {
@@ -219,35 +252,47 @@ async function getImageDigest(imgName: string): Promise<string[]> {
 
     let image = docker.getImage(imgName);
     let info = await image.inspect();
-    return info.RepoDigests;
+    return [info.RepoDigests, info.Architecture, info.Os];
 }
 
-async function getImageManifestRef(digests: string[]): Promise<[string, string]> {
-    let repository: string;
-    let manifestData: string;
+async function getImageManifestRef(digests: string[], arch: string, os: string): Promise<[string, string]> {
+    let imageRepository: string;
+    let manifestRepository: string;
+    let manifests: string;
     let manifestRef: string;
     for (let digest of digests) {
         let at = digest.indexOf("@");
         let repo = digest.slice(8, at);
         let ref = digest.slice(at + 1);
         let path = '/api/v1/repository/' + repo + '/manifest/' + ref;
-        let restRes: rm.IRestResponse<Manifest> = await restc.get<Manifest>(path);
+        let restRes: rm.IRestResponse<ManifestPayload> = await restc.get<ManifestPayload>(path);
         if (restRes.statusCode !== httpm.HttpCodes.NotFound) {
-            repository = repo;
             if (restRes.result.is_manifest_list) {
-                manifestData = restRes.result.manifest_data;
+                imageRepository = repo;
+                manifests = restRes.result.manifest_data;
             } else {
+                manifestRepository = repo;
                 manifestRef = restRes.result.digest;
             }
         }
     }
 
-    if (repository !== undefined && manifestRef !== undefined) {
-        return [repository, manifestRef];
+    if (manifestRepository !== undefined && manifestRef !== undefined) {
+        return [manifestRepository, manifestRef];
     }
 
-    //todo
-}
+    console.log(process.arch);
 
+    if (imageRepository !== undefined && manifests !== undefined) {
+        let manifestData: ManifestData = JSON.parse(manifests);
+        for (let manifest of manifestData.manifests) {
+            if (os === manifest.platform.os && arch === manifest.platform.architecture) {
+                return [imageRepository, manifest.digest];
+            }
+        }
+    }
+
+    return [undefined, undefined];
+}
 
 const isError = (err: unknown): err is Error => err instanceof Error;
