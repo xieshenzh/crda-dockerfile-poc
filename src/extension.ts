@@ -137,8 +137,8 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
                         continue;
                     }
 
-                    let [message, severity] = await getImageVulnerabilities(repo, digest);
-                    if (message !== undefined) {
+                    let [vulnerability, message, severity] = await getImageVulnerabilities(image, repo, digest);
+                    if (vulnerability !== undefined && message !== undefined) {
                         let messageSeverity: DiagnosticSeverity;
                         if (severity === "Critical" || severity === "High") {
                             messageSeverity = DiagnosticSeverity.Error;
@@ -150,13 +150,13 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
 
                         let range = from.getImageRange();
                         diagnostics.push({
-                            code: '',
+                            code: vulnerability,
                             message: message,
                             range: new vscode.Range(new vscode.Position(range?.start.line!, range?.start.character!),
                                 new vscode.Position(range?.end.line!, range?.end.character!),),
                             severity: messageSeverity,
                             source: '',
-                            relatedInformation: []
+                            relatedInformation: [],
                         });
                     }
                 } catch (error) {
@@ -181,7 +181,7 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
     }
 }
 
-async function getImageVulnerabilities(repository: string, digest: string): Promise<[string, string]> {
+async function getImageVulnerabilities(image: string, repository: string, digest: string): Promise<[string, string, string]> {
     let path = '/api/v1/repository/' + repository + '/manifest/' + digest + '/security';
     let options: rm.IRequestOptions = <rm.IRequestOptions>{
         queryParameters: {
@@ -204,32 +204,53 @@ async function getImageVulnerabilities(repository: string, digest: string): Prom
     }
 
     if (vulMap.size === 0) {
-        return [undefined, undefined];
+        return [undefined, undefined, undefined];
     }
 
-    let severitySet = new Set<string>();
-    let message: string = "";
+    // let severitySet = new Set<string>();
+    // let message: string = "";
+    // for (let severity of severities) {
+    //     for (let [n, v] of vulMap) {
+    //         if (v.Severity === severity) {
+    //             severitySet.add(v.Severity);
+    //             message += n + ": " + v.Severity;
+    //             if (v.Link !== undefined && v.Link.length > 0) {
+    //                 message += ": " + v.Link + "\n";
+    //             } else {
+    //                 message += "\n";
+    //             }
+    //         }
+    //     }
+    // }
+
+    let severityMap = new Map<string, number>();
     for (let severity of severities) {
-        for (let [n, v] of vulMap) {
-            if (v.Severity === severity) {
-                severitySet.add(v.Severity);
-                message += n + ": " + v.Severity;
-                if (v.Link !== undefined && v.Link.length > 0) {
-                    message += ": " + v.Link + "\n";
-                } else {
-                    message += "\n";
-                }
-            }
+        severityMap.set(severity, 0);
+    }
+
+    let vulnerability: string;
+    for (let [n, v] of vulMap) {
+        severityMap.set(v.Severity, severityMap.get(v.Severity) + 1);
+        if (vulnerability === undefined) {
+            vulnerability = n;
+        }
+    }
+
+    let message: string = "Image: " + image + "\n";
+    for (let severity of severities) {
+        let num = severityMap.get(severity);
+        if (num > 0) {
+            message += severity + ": " + num + "\n";
         }
     }
 
     for (let severity of severities) {
-        if (severitySet.has(severity)) {
-            return [message, severity];
+        if (severityMap.get(severity) > 0) {
+            return [vulnerability, message, severity];
         }
     }
 
-    return [message, undefined];
+    return [, message, undefined];
 }
 
 async function getImageDigest(imgName: string): Promise<[string[], string, string]> {
