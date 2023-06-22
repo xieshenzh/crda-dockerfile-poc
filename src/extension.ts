@@ -12,6 +12,9 @@ let imageRegex = new RegExp('^(?<Name>(?<=^)(?:(?<Domain>(?:(?:localhost|[\\w-]+
 let baseUrl: string = 'https://quay.io';
 let restc: rm.RestClient = new rm.RestClient('crda', baseUrl);
 
+let baseUrl2: string = 'http://localhost:8080';
+let restc2: rm.RestClient = new rm.RestClient('crda', baseUrl2);
+
 let severities: string[] = ['Critical', 'High', 'Medium', 'Low', 'Unknown'];
 let severityColors = new Map<string, string>([
     ["Critical", "color: rgb(214, 68, 86)"],
@@ -65,6 +68,16 @@ interface Data {
 interface SecurityPayload {
     status: string,
     data: Data,
+}
+
+interface Image2 {
+    ref: string,
+    vulnerabilities: Vulnerability2[],
+}
+
+interface Vulnerability2 {
+    id: string;
+    severity: string;
 }
 
 // This method is called when your extension is activated
@@ -127,17 +140,17 @@ async function updateDiagnostics(document: vscode.TextDocument): Promise<Diagnos
             console.log(image);
             if (image && imageRegex.test(image) && image.slice(0, 8).toLowerCase() === "quay.io/") {
                 try {
-                    let [digests, arch, os] = await getImageDigest(image);
-                    if (digests === undefined) {
-                        continue;
-                    }
+                    // let [digests, arch, os] = await getImageDigest(image);
+                    // if (digests === undefined) {
+                    //     continue;
+                    // }
+                    //
+                    // let [repo, digest] = await getImageManifestRef(digests, arch, os);
+                    // if (repo === undefined || digest === undefined) {
+                    //     continue;
+                    // }
 
-                    let [repo, digest] = await getImageManifestRef(digests, arch, os);
-                    if (repo === undefined || digest === undefined) {
-                        continue;
-                    }
-
-                    let [vulnerability, message, severity] = await getImageVulnerabilities(image, repo, digest);
+                    let [vulnerability, message, severity] = await getImageVulnerabilities2(image);
                     if (vulnerability !== undefined && message !== undefined) {
                         let messageSeverity: DiagnosticSeverity;
                         if (severity === "Critical" || severity === "High") {
@@ -250,7 +263,61 @@ async function getImageVulnerabilities(image: string, repository: string, digest
         }
     }
 
-    return [, message, undefined];
+    return [undefined, message, undefined];
+}
+
+async function getImageVulnerabilities2(image: string): Promise<[string, string, string]> {
+    let path = '/image/vulnerabilities';
+    let options: rm.IRequestOptions = <rm.IRequestOptions>{
+        queryParameters: {
+            params: {
+                image: image,
+            }
+        }
+    };
+
+    let restRes: rm.IRestResponse<Image2> = await restc2.get<Image2>(path, options);
+    if (restRes.statusCode !== httpm.HttpCodes.OK) {
+        throw Error("Status Code " + restRes.statusCode + " - Request to backend failed");
+    }
+
+    let vulMap = new Map<string, Vulnerability2>();
+    for (let vul of restRes.result.vulnerabilities) {
+        vulMap.set(vul.id, vul);
+    }
+
+    if (vulMap.size === 0) {
+        return [undefined, undefined, undefined];
+    }
+
+    let severityMap = new Map<string, number>();
+    for (let severity of severities) {
+        severityMap.set(severity, 0);
+    }
+
+    let vulnerability: string;
+    for (let [n, v] of vulMap) {
+        severityMap.set(v.severity, severityMap.get(v.severity) + 1);
+        if (vulnerability === undefined) {
+            vulnerability = n;
+        }
+    }
+
+    let message: string = "Image: " + image + "\n";
+    for (let severity of severities) {
+        let num = severityMap.get(severity);
+        if (num > 0) {
+            message += severity + ": " + num + "\n";
+        }
+    }
+
+    for (let severity of severities) {
+        if (severityMap.get(severity) > 0) {
+            return [vulnerability, message, severity];
+        }
+    }
+
+    return [undefined, message, undefined];
 }
 
 async function getImageDigest(imgName: string): Promise<[string[], string, string]> {
